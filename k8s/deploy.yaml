@@ -1,0 +1,155 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: robotdefense-secrets
+  namespace: robotdefense
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: "rd_pass_2026"
+  DATABASE_URL: "postgresql://rduser:rd_pass_2026@postgres.robotdefense.svc.cluster.local:5432/robotdefense"
+  ANTHROPIC_API_KEY: "REPLACE_ME"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: robotdefense
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: robotdefense
+        - name: POSTGRES_USER
+          value: rduser
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: robotdefense-secrets
+              key: POSTGRES_PASSWORD
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: robotdefense
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: robotdefense-web
+  namespace: robotdefense
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: robotdefense-web
+  template:
+    metadata:
+      labels:
+        app: robotdefense-web
+    spec:
+      containers:
+      - name: web
+        image: docker.io/library/robotdefense-web:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: robotdefense-secrets
+              key: DATABASE_URL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: robotdefense-web
+  namespace: robotdefense
+spec:
+  selector:
+    app: robotdefense-web
+  ports:
+  - port: 80
+    targetPort: 8000
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: robot-news-crawler
+  namespace: robotdefense
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: crawler
+            image: docker.io/library/robot-news-crawler:latest
+            imagePullPolicy: Never
+            env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: robotdefense-secrets
+                  key: DATABASE_URL
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: robotdefense-secrets
+                  key: ANTHROPIC_API_KEY
+            - name: KEYWORDS
+              value: "robot hacked,robot attack,robot security,AI robot threat,robot vulnerability"
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: robotdefense
+  namespace: robotdefense
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - robotdefense.io
+    secretName: robotdefense-tls
+  rules:
+  - host: robotdefense.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: robotdefense-web
+            port:
+              number: 80
