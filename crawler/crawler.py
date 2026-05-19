@@ -1,10 +1,9 @@
-import os, time, feedparser, requests, psycopg2, anthropic
+import os, time, subprocess, feedparser, requests, psycopg2
 from bs4 import BeautifulSoup
 from datetime import datetime
 
-KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "robot hacked,robot attack,robot security,AI robot threat").split(",")]
-DB_URL   = os.environ["DATABASE_URL"]
-client   = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "robot hacked,robot attack,robot security,AI robot threat,robot vulnerability").split(",")]
+DB_URL   = os.environ.get("DATABASE_URL", "postgresql://rduser:rd_pass_2026@localhost:5432/robotdefense")
 
 def init_db(conn):
     with conn.cursor() as cur:
@@ -43,20 +42,17 @@ def scrape(url):
         return None
 
 def rewrite(title, content):
-    msg = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1200,
-        system="You are an editor for robotdefense.io, a cybersecurity news site focused on robot and AI security threats. Rewrite articles in a sharp, professional security-focused tone.",
-        messages=[{"role": "user", "content": (
-            f"Rewrite this article. Return ONLY:\n"
-            f"TITLE: <rewritten title>\n"
-            f"BODY: <rewritten article body, 2-4 paragraphs>\n\n"
-            f"Original title: {title}\n\nContent:\n{content}"
-        )}]
+    prompt = (
+        "You are an editor for robotdefense.io, a cybersecurity news site focused on robot and AI security threats. "
+        "Rewrite this article in a sharp, professional security-focused tone.\n"
+        "Return ONLY:\nTITLE: <rewritten title>\nBODY: <rewritten article, 2-4 paragraphs>\n\n"
+        f"Original title: {title}\n\nContent:\n{content}"
     )
-    text = msg.content[0].text
-    rewritten_title = title
-    rewritten_body  = text
+    result = subprocess.run(["claude", "-p", prompt], capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "claude exited non-zero")
+    text = result.stdout.strip()
+    rewritten_title, rewritten_body = title, text
     for line in text.splitlines():
         if line.startswith("TITLE:"):
             rewritten_title = line[6:].strip()
@@ -77,14 +73,13 @@ def main():
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM articles WHERE original_url=%s", (url,))
                 if cur.fetchone():
-                    print(f"  skip (exists): {entry.title[:60]}")
+                    print(f"  skip: {entry.title[:60]}")
                     continue
-            print(f"  scraping: {entry.title[:60]}")
             content = scrape(url)
             if not content or len(content) < 100:
-                print("  skip (no content)")
+                print(f"  skip (no content): {entry.title[:60]}")
                 continue
-            print(f"  rewriting...")
+            print(f"  rewriting: {entry.title[:60]}")
             try:
                 rt, rb = rewrite(entry.title, content)
             except Exception as e:
