@@ -103,7 +103,7 @@ metadata:
   name: robot-news-crawler
   namespace: robotdefense
 spec:
-  schedule: "0 * * * *"
+  schedule: "*/30 * * * *"
   jobTemplate:
     spec:
       template:
@@ -125,7 +125,7 @@ spec:
                   name: robotdefense-secrets
                   key: ANTHROPIC_API_KEY
             - name: KEYWORDS
-              value: "robot hacked,robot attack,robot security,AI robot threat,robot vulnerability"
+              value: "robot hacked,robot cyberattack,robot exploit,robot vulnerability,robot malware,autonomous vehicle hacked,drone hacked,drone exploit,self-driving car hack,industrial robot attack,ICS robot,OT security robot,SCADA robot,AI weapon attack,AI autonomous weapon,LLM jailbreak attack,AI safety incident,Boston Dynamics security,surgical robot hack,military robot attack"
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

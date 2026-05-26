@@ -1,15 +1,24 @@
-import os, time, subprocess, feedparser, requests, psycopg2
+import os, time, subprocess, requests, psycopg2
 from bs4 import BeautifulSoup
 from datetime import datetime
+from playwright.sync_api import sync_playwright
 
-KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "robot hacked,robot attack,robot security,AI robot threat,robot vulnerability").split(",")]
-DB_URL   = os.environ.get("DATABASE_URL", "postgresql://rduser:rd_pass_2026@localhost:5432/robotdefense")
+KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS",
+    "robot hacked,robot cyberattack,robot exploit,robot vulnerability,robot malware,"
+    "autonomous vehicle hacked,drone hacked,drone exploit,self-driving car hack,"
+    "industrial robot attack,ICS robot,OT security robot,SCADA robot,"
+    "AI weapon attack,AI autonomous weapon,LLM jailbreak attack,AI safety incident,"
+    "Boston Dynamics security,surgical robot hack,military robot attack"
+).split(",")]
+
+DB_URL = os.environ.get("DATABASE_URL", "postgresql://rduser:rd_pass_2026@localhost:5432/robotdefense")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
 }
+
 
 def init_db(conn):
     with conn.cursor() as cur:
@@ -28,16 +37,50 @@ def init_db(conn):
         """)
     conn.commit()
 
-def fetch_feed(keyword):
-    url = f"https://news.google.com/rss/search?q={requests.utils.quote(keyword)}&hl=en-US&gl=US&ceid=US:en"
-    return feedparser.parse(url).entries
+
+def search_google_news(browser, keyword):
+    """Open Google News search in headless browser, return list of (title, google_url)."""
+    context = browser.new_context(
+        user_agent=HEADERS["User-Agent"],
+        locale="en-US",
+        viewport={"width": 1280, "height": 800},
+    )
+    page = context.new_page()
+    results = []
+    try:
+        search_url = f"https://news.google.com/search?q={requests.utils.quote(keyword)}&hl=en-US&gl=US&ceid=US:en"
+        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2500)
+
+        articles = page.query_selector_all("article")
+        for article in articles[:7]:
+            try:
+                a = article.query_selector("h3 a, h4 a")
+                if not a:
+                    continue
+                title = a.inner_text().strip()
+                href = a.get_attribute("href") or ""
+                if href.startswith("./"):
+                    href = "https://news.google.com" + href[1:]
+                elif href.startswith("/"):
+                    href = "https://news.google.com" + href
+                if title and href:
+                    results.append((title, href))
+            except Exception:
+                continue
+    finally:
+        context.close()
+    return results[:5]
+
 
 def resolve_url(url):
+    """Follow Google News redirect to get the real article URL."""
     try:
         r = requests.head(url, allow_redirects=True, timeout=10, headers=HEADERS)
         return r.url
     except Exception:
         return url
+
 
 def scrape(url):
     try:
@@ -58,20 +101,6 @@ def scrape(url):
         print(f"  scrape error: {e}", flush=True)
         return None
 
-def get_content(entry):
-    """Try full scrape first, fall back to RSS summary."""
-    url = resolve_url(entry.get("link", ""))
-    content = scrape(url)
-    if content and len(content) > 300:
-        return url, content
-
-    # Fall back to RSS summary/description
-    summary = BeautifulSoup(entry.get("summary", ""), "html.parser").get_text(" ", strip=True)
-    if len(summary) > 100:
-        print("  using RSS summary as fallback", flush=True)
-        return url, summary
-
-    return url, None
 
 def rewrite(title, content):
     prompt = (
@@ -88,7 +117,8 @@ def rewrite(title, content):
     text = result.stdout.strip()
     if "TITLE:" not in text or "BODY:" not in text:
         raise RuntimeError(f"Bad format: {text[:100]}")
-    rewritten_title, rewritten_body = title, text
+    rewritten_title = title
+    rewritten_body = text
     for line in text.splitlines():
         if line.startswith("TITLE:"):
             rewritten_title = line[6:].strip()
@@ -97,49 +127,59 @@ def rewrite(title, content):
             break
     return rewritten_title, rewritten_body
 
+
 def main():
     conn = psycopg2.connect(DB_URL)
     init_db(conn)
-    for keyword in KEYWORDS:
-        print(f"[+] Keyword: {keyword}", flush=True)
-        for entry in fetch_feed(keyword)[:5]:
-            if not entry.get("link"):
-                continue
 
-            real_url, content = get_content(entry)
-
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM articles WHERE original_url=%s", (real_url,))
-                if cur.fetchone():
-                    print(f"  skip (exists): {entry.title[:60]}", flush=True)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        try:
+            for keyword in KEYWORDS:
+                print(f"[+] Keyword: {keyword}", flush=True)
+                try:
+                    entries = search_google_news(browser, keyword)
+                except Exception as e:
+                    print(f"  search error: {e}", flush=True)
                     continue
 
-            if not content:
-                print(f"  skip (no content): {entry.title[:60]}", flush=True)
-                continue
+                for title, google_url in entries:
+                    real_url = resolve_url(google_url)
 
-            print(f"  rewriting: {entry.title[:60]}", flush=True)
-            try:
-                rt, rb = rewrite(entry.title, content)
-            except Exception as e:
-                print(f"  rewrite error: {e}", flush=True)
-                continue
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT id FROM articles WHERE original_url=%s", (real_url,))
+                        if cur.fetchone():
+                            print(f"  skip (exists): {title[:60]}", flush=True)
+                            continue
 
-            pub = None
-            if hasattr(entry, "published_parsed") and entry.published_parsed:
-                pub = datetime(*entry.published_parsed[:6])
+                    content = scrape(real_url)
+                    if not content:
+                        print(f"  skip (no content): {title[:60]}", flush=True)
+                        continue
 
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO articles (original_url,title,original_content,rewritten_title,rewritten_body,keyword,published_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (original_url) DO NOTHING
-                """, (real_url, entry.title, content, rt, rb, keyword, pub))
-            conn.commit()
-            print(f"  saved: {rt[:60]}", flush=True)
-            time.sleep(2)
+                    print(f"  rewriting: {title[:60]}", flush=True)
+                    try:
+                        rt, rb = rewrite(title, content)
+                    except Exception as e:
+                        print(f"  rewrite error: {e}", flush=True)
+                        continue
+
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO articles (original_url,title,original_content,rewritten_title,rewritten_body,keyword,published_at)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (original_url) DO NOTHING
+                        """, (real_url, title, content, rt, rb, keyword, datetime.utcnow()))
+                    conn.commit()
+                    print(f"  saved: {rt[:60]}", flush=True)
+                    time.sleep(2)
+
+                time.sleep(3)  # pause between keywords to avoid rate limiting
+        finally:
+            browser.close()
 
     conn.close()
     print("Done.", flush=True)
+
 
 if __name__ == "__main__":
     main()
