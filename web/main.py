@@ -30,8 +30,9 @@ def page(body, title="robotdefense.io"):
   main{{max-width:960px;margin:0 auto;padding:2rem 1.5rem}}
   .empty{{text-align:center;padding:4rem;color:#333}}
   .empty h2{{color:#00ff8833;font-size:2rem;margin-bottom:.5rem}}
-  .card{{background:#111;border:1px solid #1e1e1e;border-radius:6px;margin-bottom:1.5rem;transition:border-color .2s}}
+  .card{{background:#111;border:1px solid #1e1e1e;border-radius:6px;margin-bottom:1.5rem;overflow:hidden;transition:border-color .2s}}
   .card:hover{{border-color:#00ff8844}}
+  .card-img{{width:100%;height:200px;object-fit:cover;display:block;filter:brightness(.85) saturate(.9)}}
   .card-header{{padding:1.2rem 1.5rem .8rem;cursor:pointer}}
   .card-header h2{{font-size:1.1rem;color:#e0e0e0;margin-bottom:.5rem;line-height:1.4}}
   .meta{{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}}
@@ -63,7 +64,7 @@ document.querySelectorAll('.card-header').forEach(h=>h.addEventListener('click',
 def index():
     try:
         rows = query("""
-            SELECT id, rewritten_title, rewritten_body, keyword, published_at, original_url, created_at
+            SELECT id, rewritten_title, rewritten_body, keyword, published_at, original_url, created_at, image_url
             FROM articles ORDER BY created_at DESC LIMIT 50
         """)
     except Exception:
@@ -76,10 +77,12 @@ def index():
         </div>"""
     else:
         cards = []
-        for (aid, title, body_text, keyword, pub, src_url, created) in rows:
+        for (aid, title, body_text, keyword, pub, src_url, created, image_url) in rows:
             date_str = (pub or created).strftime("%Y-%m-%d %H:%M UTC") if (pub or created) else ""
             paras = "".join(f"<p>{p.strip()}</p>" for p in (body_text or "").split("\n") if p.strip())
+            img_src = image_url or f"https://picsum.photos/seed/{aid}/960/200"
             cards.append(f"""<div class="card">
+  <img class="card-img" src="{img_src}" onerror="this.src='https://picsum.photos/seed/{aid}/960/200'" alt="" loading="lazy">
   <div class="card-header">
     <h2>{title or 'Untitled'}</h2>
     <div class="meta">
