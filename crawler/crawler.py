@@ -1,4 +1,4 @@
-import os, time, subprocess, requests, psycopg2
+import os, time, requests, psycopg2
 from bs4 import BeautifulSoup
 from datetime import datetime
 from playwright.sync_api import sync_playwright
@@ -39,35 +39,40 @@ def init_db(conn):
 
 
 def search_google_news(browser, keyword):
-    """Open Google News search in headless browser, return list of (title, google_url)."""
+    """Search Google News in headless browser, return list of (title, url)."""
     context = browser.new_context(
         user_agent=HEADERS["User-Agent"],
         locale="en-US",
         viewport={"width": 1280, "height": 800},
+        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
     )
+    context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     page = context.new_page()
+    try:
+        from playwright_stealth import stealth_sync
+        stealth_sync(page)
+    except ImportError:
+        pass
     results = []
     try:
         search_url = f"https://news.google.com/search?q={requests.utils.quote(keyword)}&hl=en-US&gl=US&ceid=US:en"
-        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(2500)
+        page.goto(search_url, wait_until="networkidle", timeout=45000)
+        page.wait_for_timeout(3000)
 
-        articles = page.query_selector_all("article")
-        for article in articles[:7]:
-            try:
-                a = article.query_selector("h3 a, h4 a")
-                if not a:
-                    continue
-                title = a.inner_text().strip()
-                href = a.get_attribute("href") or ""
-                if href.startswith("./"):
-                    href = "https://news.google.com" + href[1:]
-                elif href.startswith("/"):
-                    href = "https://news.google.com" + href
-                if title and href:
-                    results.append((title, href))
-            except Exception:
-                continue
+        items = page.evaluate("""() => {
+            const seen = new Set();
+            const out = [];
+            document.querySelectorAll('a').forEach(a => {
+                const href = a.href || '';
+                const text = a.textContent.trim();
+                if (href.includes('news.google.com/read/') && text.length > 20 && !seen.has(href)) {
+                    seen.add(href);
+                    out.push({href, text});
+                }
+            });
+            return out.slice(0, 7);
+        }""")
+        results = [(i["text"], i["href"]) for i in items]
     finally:
         context.close()
     return results[:5]
@@ -102,30 +107,7 @@ def scrape(url):
         return None
 
 
-def rewrite(title, content):
-    prompt = (
-        "You are an editor for robotdefense.io, a cybersecurity news site focused on robot and AI security threats. "
-        "Rewrite this article in a sharp, professional security-focused tone.\n"
-        "Return ONLY in this exact format:\n"
-        "TITLE: <rewritten title>\n"
-        "BODY: <rewritten article, 2-4 paragraphs>\n\n"
-        f"Original title: {title}\n\nContent:\n{content}"
-    )
-    result = subprocess.run(["claude", "-p", prompt], capture_output=True, text=True, timeout=60)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "claude exited non-zero")
-    text = result.stdout.strip()
-    if "TITLE:" not in text or "BODY:" not in text:
-        raise RuntimeError(f"Bad format: {text[:100]}")
-    rewritten_title = title
-    rewritten_body = text
-    for line in text.splitlines():
-        if line.startswith("TITLE:"):
-            rewritten_title = line[6:].strip()
-        if line.startswith("BODY:"):
-            rewritten_body = text[text.index("BODY:") + 5:].strip()
-            break
-    return rewritten_title, rewritten_body
+PROXY = os.environ.get("SOCKS5_PROXY", "socks5://100.106.168.18:1080")
 
 
 def main():
@@ -133,7 +115,11 @@ def main():
     init_db(conn)
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            proxy={"server": PROXY},
+        )
         try:
             for keyword in KEYWORDS:
                 print(f"[+] Keyword: {keyword}", flush=True)
@@ -157,20 +143,13 @@ def main():
                         print(f"  skip (no content): {title[:60]}", flush=True)
                         continue
 
-                    print(f"  rewriting: {title[:60]}", flush=True)
-                    try:
-                        rt, rb = rewrite(title, content)
-                    except Exception as e:
-                        print(f"  rewrite error: {e}", flush=True)
-                        continue
-
                     with conn.cursor() as cur:
                         cur.execute("""
                             INSERT INTO articles (original_url,title,original_content,rewritten_title,rewritten_body,keyword,published_at)
                             VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (original_url) DO NOTHING
-                        """, (real_url, title, content, rt, rb, keyword, datetime.utcnow()))
+                        """, (real_url, title, content, title, content, keyword, datetime.utcnow()))
                     conn.commit()
-                    print(f"  saved: {rt[:60]}", flush=True)
+                    print(f"  saved: {title[:60]}", flush=True)
                     time.sleep(2)
 
                 time.sleep(3)  # pause between keywords to avoid rate limiting
