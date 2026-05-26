@@ -65,7 +65,7 @@ def index():
     try:
         rows = query("""
             SELECT id, rewritten_title, rewritten_body, keyword, published_at, original_url, created_at, image_url
-            FROM articles ORDER BY created_at DESC LIMIT 50
+            FROM articles ORDER BY created_at DESC LIMIT 500
         """)
     except Exception:
         rows = []
