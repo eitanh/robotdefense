@@ -1,4 +1,4 @@
-import os, time, requests, psycopg2
+import os, time, re, json as _json, requests, psycopg2
 from bs4 import BeautifulSoup
 from datetime import datetime
 from playwright.sync_api import sync_playwright
@@ -98,21 +98,86 @@ def resolve_url(url):
         return url
 
 
+def extract_image(soup):
+    """Try all image sources from a parsed page, return best URL or None."""
+    # 1. og:image / twitter:image meta tags
+    for attr in [{"property": "og:image"}, {"property": "og:image:url"},
+                 {"name": "twitter:image"}, {"name": "twitter:image:src"}]:
+        tag = soup.find("meta", attrs=attr)
+        if tag:
+            src = tag.get("content", "").strip()
+            if src.startswith("http"):
+                return src
+
+    # 2. JSON-LD structured data (NewsArticle, Article)
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = _json.loads(script.string or "")
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            img = data.get("image") or data.get("thumbnailUrl")
+            if isinstance(img, dict):
+                img = img.get("url") or img.get("contentUrl")
+            if isinstance(img, list):
+                img = img[0] if img else None
+                if isinstance(img, dict):
+                    img = img.get("url")
+            if img and str(img).startswith("http"):
+                return str(img)
+        except Exception:
+            continue
+
+    # 3. First large <img> in article body (skip tiny icons/trackers)
+    skip = {"icon", "logo", "avatar", "pixel", "1x1", "spacer", "placeholder", "spinner"}
+    for img_tag in soup.find_all("img"):
+        src = (img_tag.get("src") or img_tag.get("data-src") or img_tag.get("data-lazy-src") or "").strip()
+        if not src.startswith("http"):
+            continue
+        if any(s in src.lower() for s in skip):
+            continue
+        try:
+            w = int(str(img_tag.get("width", "0")).replace("px", ""))
+            if w < 200:
+                continue
+        except ValueError:
+            pass
+        return src
+
+    return None
+
+
+def fetch_wiki_image(query):
+    """Wikipedia page image search — free, no API key, no rate limiting."""
+    try:
+        r = requests.get("https://en.wikipedia.org/w/api.php",
+                         params={"action": "query", "list": "search",
+                                 "srsearch": query, "srlimit": 3,
+                                 "format": "json", "srprop": ""},
+                         headers=HEADERS, timeout=10)
+        results = r.json().get("query", {}).get("search", [])
+        if not results:
+            return None
+        titles = "|".join(res["title"] for res in results)
+        r2 = requests.get("https://en.wikipedia.org/w/api.php",
+                          params={"action": "query", "titles": titles,
+                                  "prop": "pageimages", "pithumbsize": 800,
+                                  "format": "json", "pilicense": "any"},
+                          headers=HEADERS, timeout=10)
+        for page in r2.json().get("query", {}).get("pages", {}).values():
+            src = page.get("thumbnail", {}).get("source", "")
+            if src.startswith("http"):
+                return src
+    except Exception:
+        pass
+    return None
+
+
 def scrape(url):
-    """Fetch article, return (content, og_image_url)."""
+    """Fetch article, return (content, image_url)."""
     try:
         r = requests.get(url, timeout=15, allow_redirects=True, headers=HEADERS)
         soup = BeautifulSoup(r.content, "html.parser")
-
-        # Extract og:image or twitter:image
-        image_url = None
-        for attr in [{"property": "og:image"}, {"name": "twitter:image"}, {"name": "twitter:image:src"}]:
-            tag = soup.find("meta", attrs=attr)
-            if tag:
-                src = tag.get("content", "").strip()
-                if src.startswith("http"):
-                    image_url = src
-                    break
+        image_url = extract_image(soup)
 
         for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
             tag.decompose()
@@ -131,32 +196,34 @@ def scrape(url):
 
 
 def backfill_images(conn):
-    """Fetch og:image for existing articles that have no image_url."""
+    """Fill image_url for articles that have none: try scrape then DDG search."""
     with conn.cursor() as cur:
-        cur.execute("SELECT id, original_url FROM articles WHERE image_url IS NULL LIMIT 50")
+        cur.execute("""
+            SELECT id, original_url, title, keyword
+            FROM articles WHERE image_url IS NULL LIMIT 60
+        """)
         rows = cur.fetchall()
     if not rows:
         return
     print(f"[~] Backfilling images for {len(rows)} articles...", flush=True)
-    for aid, url in rows:
+    for aid, url, title, keyword in rows:
+        img_url = None
         try:
             r = requests.get(url, timeout=10, allow_redirects=True, headers=HEADERS)
             soup = BeautifulSoup(r.content, "html.parser")
-            img_url = None
-            for attr in [{"property": "og:image"}, {"name": "twitter:image"}, {"property": "og:image:url"}]:
-                tag = soup.find("meta", attrs=attr)
-                if tag:
-                    src = tag.get("content", "").strip()
-                    if src.startswith("http"):
-                        img_url = src
-                        break
-            if img_url:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE articles SET image_url=%s WHERE id=%s", (img_url, aid))
-                conn.commit()
-                print(f"  imaged: {url[:60]}", flush=True)
+            img_url = extract_image(soup)
         except Exception:
             pass
+
+        if not img_url:
+            query = f"{title} {keyword}" if title else keyword
+            img_url = fetch_wiki_image(query) or fetch_wiki_image(keyword)
+
+        if img_url:
+            print(f"  wiki image: {title[:50]}", flush=True)
+            with conn.cursor() as cur:
+                cur.execute("UPDATE articles SET image_url=%s WHERE id=%s", (img_url, aid))
+            conn.commit()
         time.sleep(0.5)
 
 
@@ -193,8 +260,8 @@ def main():
                         print(f"  skip (no content): {title[:60]}", flush=True)
                         continue
 
-                    # prefer og:image, fall back to Google News thumbnail
-                    image_url = og_image or thumbnail or None
+                    # prefer og:image → GN thumbnail → DDG search
+                    image_url = og_image or thumbnail or fetch_wiki_image(f"{title} {keyword}")
 
                     with conn.cursor() as cur:
                         cur.execute("""
